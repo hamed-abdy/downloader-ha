@@ -1,4 +1,4 @@
-name: 🗑 Clean downloads folder
+name: 🗑 Clean downloads folder (fast)
 
 on:
   workflow_dispatch:
@@ -12,22 +12,47 @@ jobs:
   delete:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout only downloads folder (fast)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-          sparse-checkout: downloads
-          sparse-checkout-cone-mode: false
-
-      - name: Delete all files inside downloads/
+      - name: Delete files via GitHub API (no full checkout)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          rm -rf downloads/*
-          mkdir -p downloads
-
-      - name: Commit and push empty folder
-        run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add downloads/
-          git commit -m "Empty downloads folder [skip ci]" || echo "No changes to commit"
-          git push
+          # Get current commit SHA
+          SHA=$(gh api repos/$REPO/git/refs/heads/$BRANCH --jq '.object.sha')
+          
+          # Get current tree SHA
+          TREE_SHA=$(gh api repos/$REPO/git/commits/$SHA --jq '.tree.sha')
+          
+          # List all files in downloads/ folder recursively
+          FILES=$(gh api repos/$REPO/git/trees/$TREE_SHA?recursive=1 --jq '.tree[] | select(.path | startswith("downloads/")) | .path')
+          
+          if [ -z "$FILES" ]; then
+            echo "No files found in downloads/ folder. Exiting."
+            exit 0
+          fi
+          
+          # Prepare delete entries
+          echo "Deleting files:"
+          echo "$FILES"
+          
+          # Create a new tree with deletions (filename => null)
+          DELETE_JSON="{\"base_tree\":\"$TREE_SHA\",\"tree\":["
+          FIRST=true
+          while IFS= read -r file; do
+            if [ "$FIRST" = true ]; then FIRST=false; else DELETE_JSON="$DELETE_JSON,"; fi
+            DELETE_JSON="$DELETE_JSON{\"path\":\"$file\",\"mode\":null,\"type\":\"blob\",\"sha\":null}"
+          done <<< "$FILES"
+          DELETE_JSON="$DELETE_JSON]}"
+          
+          NEW_TREE_SHA=$(echo "$DELETE_JSON" | gh api repos/$REPO/git/trees -H "Content-Type: application/json" --input - --jq '.sha')
+          
+          # Create commit
+          COMMIT_MSG="Empty downloads folder [skip ci]"
+          NEW_COMMIT_SHA=$(gh api repos/$REPO/git/commits -H "Content-Type: application/json" \
+            -f "message=$COMMIT_MSG" -f "tree=$NEW_TREE_SHA" -f "parents[]=$SHA" --jq '.sha')
+          
+          # Update branch
+          gh api repos/$REPO/git/refs/heads/$BRANCH -X PATCH -f "sha=$NEW_COMMIT_SHA" -f "force=false"
+          
+          echo "✅ All files deleted from downloads/ folder."
